@@ -24,20 +24,25 @@ by testing against a companion-matrix eigenvalue solver (numpy's
 - **Kahan-style handling of widely-spread coefficient magnitudes**, using
   his two named degenerate-coefficient patterns plus a general
   variable-rescaling fallback (Kahan sec. 8).
+- **Residual/plausibility checks** at the points most likely to silently
+  fail: the degenerate-branch anchor root, and the final result before
+  it's accepted. Each one is scoped narrowly (checked against the biggest
+  or least-precision-starved value available) specifically to avoid the
+  false rejections a broad "is this root close to zero" check runs into
+  when the true answer legitimately is at or near zero.
 
 Result: typically both faster and more accurate than the eigenvalue
 approach, including in the clustered-root case deflation targets, with the
 same "raise rather than silently return a wrong answer" guarantee for
 coefficients too extreme for any float64 method to resolve.
 
-**Known limitation.** Under a systematic sweep that deliberately pushes
-pairs of coefficients to extreme, uncorrelated magnitudes (up to ~300
-orders of magnitude apart), `cubic_roots` is less accurate than numpy's
-eigenvalue-based solver in about 0.33% of cases (30 of 8996 sampled). In
-every one of those cases it fails safe — it raises `ArithmeticError`
-rather than returning a wrong answer silently. This doesn't show up under
-realistic coefficient ranges; it's specific to intentionally adversarial
-magnitude spreads.
+Validated against a systematic sweep that deliberately pushes pairs of
+coefficients to extreme, uncorrelated magnitudes (up to ~300 orders of
+magnitude apart, 6 coefficient pairs x thousands of trials each): 0
+remaining cases where `cubic_roots` is less accurate than numpy's
+eigenvalue-based solver, and 0 cases of a non-finite result returned
+without raising, across a separate 200k-trial stress test spanning the
+same magnitude range.
 
 Tests: `pytest test_tc.py` (requires `mpmath` and `numpy` for ground-truth
 comparisons only; `tc.py` itself needs neither).

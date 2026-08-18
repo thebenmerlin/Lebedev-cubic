@@ -26,11 +26,17 @@ def mp_roots(A, B, C, D):
 
 
 def match_error(got, true):
-    """Best-permutation max relative error between got and true."""
+    """Best-permutation max relative error between got and true,
+    scale-aware: a fixed tiny floor on the denominator makes any
+    nonzero-but-negligible computed value register as "infinitely"
+    wrong whenever the true root happens to be exactly 0, even though
+    it's correct in every sense that matters. Floor relative to the
+    problem's own scale instead."""
     got = [complex(g) for g in got]
+    scale = max([abs(t) for t in true] + [abs(g) for g in got] + [1e-300])
     best = float("inf")
     for perm in permutations(range(3)):
-        err = max(abs(got[perm[i]] - true[i]) / max(abs(true[i]), 1e-300)
+        err = max(abs(got[perm[i]] - true[i]) / max(abs(true[i]), scale * 1e-12)
                    for i in range(3))
         best = min(best, err)
     return best
@@ -198,6 +204,73 @@ def test_subnormal_x_is_not_rejected_by_the_compound_degeneracy_check():
     # near 0, and needs the same kind of exemption.
     A, B, C, D = -1.9192995433020904e+44, 1.1331553724392622e-212, \
         9.619131160888853e+267, 3.5631818321321395e-119
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
+def test_degenerate_split_root_is_not_trusted_without_a_residual_check():
+    # Found by a systematic 6-pair adversarial sweep: D negligible
+    # next to C triggers the split-branch heuristic, which picked the
+    # reduced quadratic's smaller root as the anchor. But that root
+    # was itself an artifact of a *nested* degeneracy (C is also
+    # negligible next to B), and what's actually a tiny complex pair
+    # near the origin got misresolved into two separate real numbers.
+    # A residual check on the chosen anchor catches this and falls
+    # through to the general path, which resolves the real-vs-complex
+    # classification correctly on its own.
+    A, B, C, D = -70.10536394165119, 1.012614082208495, \
+        3.389695903964271e-17, 1.970194859326598e-31
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
+def test_degenerate_no_split_branch_does_not_cancel_the_other_two_roots():
+    # Companion bug to the one above, in the *other* branch: when "A
+    # negligible next to B" has no magnitude split, X is trusted
+    # directly. The old code re-derived the other two roots via
+    # sum_all - X on the original cubic, but sum_all and X are both
+    # computed as -B/A, the identical formula, so the subtraction
+    # always came out exactly 0.0 instead of the true (tiny, nonzero)
+    # sum of the other two roots, silently corrupting them. Trusting
+    # the reduced quadratic's own roots directly (already reliable
+    # here) fixes it.
+    A, B, C, D = -1.8423015662660234e-20, -324678.49087411177, \
+        -69.42071618534116, -0.13745276928356648
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
+def test_plausibility_check_catches_uniformly_scaled_wrong_roots():
+    # Coefficients spread across the full leading-vs-constant-term
+    # axis (A and D both extreme, B and C moderate): the raw Lebedev
+    # formula returned every root scaled by the same ~1.12x factor,
+    # finite and internally self-consistent-looking but wrong, and
+    # cubic_roots accepted it because its only prior check was
+    # finiteness. A residual check on the largest-magnitude root
+    # (least starved for precision, so least likely to false-positive)
+    # catches this and triggers the rho-rescaling fallback, which
+    # gets it right.
+    A, B, C, D = -1.939359988786091, 1.1179094786494463e+38, \
+        4.607486747369584, 5.872879939134045e+145
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
+def test_plausibility_check_survives_overflow_in_its_own_residual():
+    # Companion to the case above: here the root itself (~8.8e86)
+    # isn't large enough to overflow on its own, but A (~8.9e48) is
+    # large enough that A*r*r*r overflows anyway. For a complex r
+    # that overflow produces inf+nan*j (cross terms hitting inf*0),
+    # not a clean inf, which would poison the plausibility check into
+    # rejecting a root that's actually correct. Detecting the
+    # overflow directly (rather than pre-guessing a safe magnitude
+    # for r alone) is what this locks in.
+    A, B, C, D = -8.88669336791929e+48, -7.790076373558184e+135, \
+        -0.2118936812953135, 10.442595408862642
     got = cubic_roots(A, B, C, D)
     true = mp_roots(A, B, C, D)
     assert match_error(got, true) < 1e-6

@@ -65,6 +65,37 @@ def _mul_underflowed(*factors):
     return product == 0.0
 
 
+def _plausible(roots, A, B, C, D):
+    """Residual check on the largest-magnitude root only: picking the
+    biggest root specifically sidesteps the near-zero blind spot a
+    residual check has on a small root (Q(0) = D identically). If
+    even the least precision-starved root doesn't satisfy the
+    original cubic to reasonable relative precision, the whole result
+    is untrustworthy: confirmed against a case where coefficients
+    were spread across the full leading-vs-constant-term axis (A and
+    D both extreme, B and C moderate) and the raw Lebedev formula
+    came back with every root scaled by the same ~1.12x factor,
+    finite and self-consistent-looking but wrong, because the
+    rescaling fallback was never triggered (see test_tc.py).
+
+    Skips the check when computing the terms themselves overflows:
+    not just when r is huge, but also when A or B alone is huge
+    enough that A*r*r*r or B*r*r overflows even for a moderate r (a
+    real case: r ~ 8.8e86 but A ~ 8.9e48, so A*r*r*r overflows on its
+    own). For a *complex* r that overflow produces inf+nan*j (cross
+    terms hitting inf*0) rather than a clean inf, which would poison
+    the comparison into a false rejection of a root that's actually
+    correct. Detecting the overflow directly, rather than guessing a
+    safe magnitude threshold up front, catches both routes to it."""
+    r = max(roots, key=abs)
+    t0, t1, t2, t3 = A * r * r * r, B * r * r, C * r, D
+    if not (cmath.isfinite(t0) and cmath.isfinite(t1) and cmath.isfinite(t2)):
+        return True
+    residual = t0 + t1 + t2 + t3
+    scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
+    return abs(residual) <= 1e-6 * scale
+
+
 def _quadratic_roots(c0, c1, c2):
     """Stable roots of c2*x^2 + c1*x + c0 = 0. Avoids the
     cancellation the naive +/- quadratic formula suffers by picking
@@ -236,6 +267,32 @@ def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
     mag_a, mag_b = abs(ra), abs(rb)
     if mag_a > 0 and mag_b > 0 and min(mag_a, mag_b) < 1e-8 * max(mag_a, mag_b):
         r0 = ra if mag_a <= mag_b else rb
+        # The reduced quadratic doesn't know about the coefficient
+        # that made this branch degenerate in the first place (D for
+        # the "D negligible next to C" pattern), so its own small
+        # root can be an artifact of a *further* nested degeneracy:
+        # what's actually a tiny complex-conjugate pair near the
+        # origin gets misresolved into two separate real numbers,
+        # neither of them right, even though each looks like a
+        # plausible small real root in isolation. Sanity-check r0
+        # against the full cubic before trusting it; if it doesn't
+        # hold up, fall through to the general Lebedev+deflation path,
+        # which resolves the real-vs-complex classification correctly
+        # on its own (confirmed against mpmath, see test_tc.py).
+        if abs(r0) > 1e-300:
+            t0, t1, t2, t3 = A * r0 * r0 * r0, B * r0 * r0, C * r0, D
+            residual = t0 + t1 + t2 + t3
+            scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
+            if abs(residual) > 1e-6 * scale:
+                return None
+        # X can't be trusted here (see docstring above), so the other
+        # two roots have to be re-derived from Vieta's relations on
+        # the original cubic rather than taken as "X and the reduced
+        # quadratic's other root" directly.
+        sum_all = -B / A
+        product_all = -D / A
+        r1, r2 = _quadratic_roots(product_all / r0, -(sum_all - r0), 1.0)
+        return complex(r0), r1, r2
     else:
         # No magnitude split to fall back on, so X has to be the
         # anchor. Sanity-check it first: X is derived by assuming
@@ -269,13 +326,18 @@ def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
             scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
             if abs(residual) > 1e-6 * scale:
                 return None
-        r0 = X
-    sum_all = -B / A
-    product_all = -D / A
-    if r0 == 0:
+        # X checks out, and (empirically) the reduced quadratic's own
+        # roots are reliable here too, unlike in the magnitude-split
+        # branch above: trust them directly instead of re-deriving via
+        # Vieta on the original cubic. That re-derivation needs
+        # sum_all - X to isolate "sum of the other two roots", but for
+        # the "A negligible next to B" pattern, X and sum_all are both
+        # computed as -B/A, the identical formula, so the subtraction
+        # is always exactly 0.0 by construction rather than the small
+        # nonzero residual it's supposed to recover, silently
+        # corrupting an otherwise-correct pair of roots (confirmed
+        # against mpmath, see test_tc.py).
         return complex(X), ra, rb
-    r1, r2 = _quadratic_roots(product_all / r0, -(sum_all - r0), 1.0)
-    return complex(r0), r1, r2
 
 
 def _refine_tiny_leftover_root(roots, A, D):
@@ -430,7 +492,7 @@ def cubic_roots(A, B, C, D):
             return None
 
     r = attempt(A, B, C, D)
-    if r is not None and _all_finite(*r):
+    if r is not None and _all_finite(*r) and _plausible(r, A, B, C, D):
         return r
 
     if D != 0:
@@ -452,7 +514,7 @@ def cubic_roots(A, B, C, D):
                 # this multiplication can itself overflow even when r2
                 # (in y-space) was finite.
                 r2 = tuple(v * rho for v in r2)
-                if _all_finite(*r2):
+                if _all_finite(*r2) and _plausible(r2, A, B, C, D):
                     return r2
 
     raise ArithmeticError(
