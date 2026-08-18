@@ -37,8 +37,30 @@ cubic_roots() itself).
 """
 import cmath
 import math
+import sys
 
 __all__ = ["cubic_roots"]
+
+# Small/large tolerances below are expressed as round multiples of
+# machine epsilon (sys.float_info.epsilon, the pure-Python equivalent
+# of np.finfo(float64).eps - no numpy dependency needed for it)
+# rather than bare decimal literals, so each one's role - "how many
+# units of floating-point precision before something counts as
+# negligible" - is explicit instead of an opaque magic number. The
+# multipliers themselves are still empirically tuned (via the
+# adversarial sweep in test_tc.py), not derived from first principles;
+# Kahan's own tolerance choices in the source paper are similarly
+# empirical. This only covers tolerances introduced during this
+# port's own accuracy work; the constants inside _tc are part of a
+# line-for-line translation of Lebedev's original Fortran and are left
+# untouched so that function stays auditable against tc.f90, and the
+# 1e-300-scale floors elsewhere guard against literal division by
+# zero rather than expressing a precision-relative tolerance, so
+# they're not epsilon multiples either.
+_EPS = sys.float_info.epsilon
+_DEGENERATE_TOL = 5e2 * _EPS   # ~1.11e-13
+_SPLIT_TOL = 5e7 * _EPS        # ~1.11e-8
+_RESIDUAL_TOL = 5e9 * _EPS     # ~1.11e-6
 
 
 def _all_finite(*vals):
@@ -107,7 +129,7 @@ def _plausible(roots, A, B, C, D):
         return True
     residual = t0 + t1 + t2 + t3
     scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
-    return abs(residual) <= 1e-6 * scale
+    return abs(residual) <= _RESIDUAL_TOL * scale
 
 
 def _quadratic_roots(c0, c1, c2):
@@ -145,7 +167,7 @@ def _tc(A, B, C, D):
     s = max(abs(A), abs(B), abs(C), abs(D))
     A, B, C, D = A / s, B / s, C / s, D / s
 
-    T = 1.7320508075688772  # sqrt(3)
+    T = math.sqrt(3.0)
     S = 1.0 / 3.0
     T2 = B * B
     T3 = 3.0 * A
@@ -242,9 +264,6 @@ def _tc(A, B, C, D):
             return (x1 - T3b, x2 - T3b, x3 - T3b), True
 
 
-_DEGENERATE_TOL = 1e-13
-
-
 def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
     """Shared logic for both of Kahan's degenerate-coefficient
     branches. X is Kahan's own direct approximation (-B/A for the
@@ -279,7 +298,7 @@ def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
     """
     ra, rb = _quadratic_roots(reduced_c0, reduced_c1, reduced_c2)
     mag_a, mag_b = abs(ra), abs(rb)
-    if mag_a > 0 and mag_b > 0 and min(mag_a, mag_b) < 1e-8 * max(mag_a, mag_b):
+    if mag_a > 0 and mag_b > 0 and min(mag_a, mag_b) < _SPLIT_TOL * max(mag_a, mag_b):
         r0 = ra if mag_a <= mag_b else rb
         # The reduced quadratic doesn't know about the coefficient
         # that made this branch degenerate in the first place (D for
@@ -297,7 +316,7 @@ def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
             t0, t1, t2, t3 = A * r0 * r0 * r0, B * r0 * r0, C * r0, D
             residual = t0 + t1 + t2 + t3
             scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
-            if abs(residual) > 1e-6 * scale:
+            if abs(residual) > _RESIDUAL_TOL * scale:
                 return None
         # X can't be trusted here (see docstring above), so the other
         # two roots have to be re-derived from Vieta's relations on
@@ -338,7 +357,7 @@ def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
             t0, t1, t2, t3 = A * X * X * X, B * X * X, C * X, D
             residual = t0 + t1 + t2 + t3
             scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
-            if abs(residual) > 1e-6 * scale:
+            if abs(residual) > _RESIDUAL_TOL * scale:
                 return None
         # X checks out, and (empirically) the reduced quadratic's own
         # roots are reliable here too, unlike in the magnitude-split
@@ -378,7 +397,7 @@ def _refine_tiny_leftover_root(roots, A, D):
     if scale == 0:
         return roots
     i = min(range(3), key=lambda k: mags[k])
-    if mags[i] > 1e-8 * scale:
+    if mags[i] > _SPLIT_TOL * scale:
         return roots
     others = [roots[k] for k in range(3) if k != i]
     denom = others[0] * others[1]
@@ -487,6 +506,14 @@ def cubic_roots(A, B, C, D):
     plus deflation and Kahan-style scaling; see the module docstring
     for references and test_tc.py for the validation this is based
     on.
+
+    Always computes in double precision: A, B, C, D and the returned
+    roots are Python's native float/complex, which are float64 and
+    complex128 respectively (there is no single-precision float in
+    the language itself). There is no float32 path and no dtype
+    preservation the way numpy's own routines have, since supporting
+    that would mean depending on numpy, which this module deliberately
+    does not.
     """
     A, B, C, D = float(A), float(B), float(C), float(D)
     if A == 0:
