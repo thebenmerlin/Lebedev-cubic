@@ -86,7 +86,21 @@ def _plausible(roots, A, B, C, D):
     terms hitting inf*0) rather than a clean inf, which would poison
     the comparison into a false rejection of a root that's actually
     correct. Detecting the overflow directly, rather than guessing a
-    safe magnitude threshold up front, catches both routes to it."""
+    safe magnitude threshold up front, catches both routes to it.
+
+    Also skips the check up front when A, B, C, D are all within a
+    normal range of each other: every known case this check exists
+    to catch has coefficients spread over 130+ orders of magnitude
+    (see test_tc.py), while even the widest spread seen across
+    thousands of typical/clustered random cubics is ~1e21. 1e25
+    leaves a huge margin on both sides, so this stays a pure speed
+    optimization (skips the residual computation's cost on the
+    common well-scaled path) rather than a narrowing of what gets
+    checked."""
+    mags = [abs(A), abs(B), abs(C), abs(D)]
+    nonzero_mags = [m for m in mags if m > 0]
+    if max(nonzero_mags) < 1e25 * min(nonzero_mags):
+        return True
     r = max(roots, key=abs)
     t0, t1, t2, t3 = A * r * r * r, B * r * r, C * r, D
     if not (cmath.isfinite(t0) and cmath.isfinite(t1) and cmath.isfinite(t2)):
