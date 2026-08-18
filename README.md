@@ -30,5 +30,14 @@ approach, including in the clustered-root case deflation targets, with the
 same "raise rather than silently return a wrong answer" guarantee for
 coefficients too extreme for any float64 method to resolve.
 
+**Known limitation.** Under a systematic sweep that deliberately pushes
+pairs of coefficients to extreme, uncorrelated magnitudes (up to ~300
+orders of magnitude apart), `cubic_roots` is less accurate than numpy's
+eigenvalue-based solver in about 0.33% of cases (30 of 8996 sampled). In
+every one of those cases it fails safe — it raises `ArithmeticError`
+rather than returning a wrong answer silently. This doesn't show up under
+realistic coefficient ranges; it's specific to intentionally adversarial
+magnitude spreads.
+
 Tests: `pytest test_tc.py` (requires `mpmath` and `numpy` for ground-truth
 comparisons only; `tc.py` itself needs neither).

@@ -48,6 +48,23 @@ def _all_finite(*vals):
     return True
 
 
+def _mul_underflowed(*factors):
+    """True if multiplying these nonzero factors together produced an
+    exact 0.0. Two or more nonzero finite floats can never
+    mathematically multiply to exactly zero, so this is an
+    unambiguous underflow signal, not a heuristic: unlike a residual
+    check, it has no false positives (a genuine near-zero product
+    would round to some nonzero subnormal, not land on exactly 0)
+    and no false negatives caused by the check's own arithmetic
+    overflowing, because it does none."""
+    product = 1.0
+    for f in factors:
+        if f == 0.0:
+            return False  # a genuine zero factor, not an underflow
+        product *= f
+    return product == 0.0
+
+
 def _quadratic_roots(c0, c1, c2):
     """Stable roots of c2*x^2 + c1*x + c0 = 0. Avoids the
     cancellation the naive +/- quadratic formula suffers by picking
@@ -61,7 +78,7 @@ def _quadratic_roots(c0, c1, c2):
         d = -d
     q = -0.5 * (c1n + d)
     if q == 0:
-        return 0j, -c1n / c2n
+        return 0j, complex(-c1n / c2n)
     return q / c2n, c0n / q
 
 
@@ -88,9 +105,24 @@ def _tc(A, B, C, D):
     T2 = B * B
     T3 = 3.0 * A
     T4 = T3 * C
+    if _mul_underflowed(T3, C) and T4 == 0.0:
+        # 3*A*C underflowed to exactly 0 despite A and C both being
+        # meaningfully sized after normalization: this corrupts P
+        # (misclassifying it as ~B^2, which can misroute this whole
+        # branch into "triple root at the origin" for a cubic that
+        # doesn't remotely have one). Signal failure so cubic_roots
+        # retries through the variable-rescaling fallback instead of
+        # continuing on bad data.
+        nan = float("nan")
+        return (nan, nan, nan), True
     P = T2 - T4
     X3 = abs(P) ** 0.5
-    X1 = B * (T4 - P - P) - 3.0 * T3 * T3 * D
+    d_term = 3.0 * T3 * T3 * D
+    if _mul_underflowed(T3, T3, D) and d_term == 0.0:
+        # Same failure mode, for the A^2*D term inside X1.
+        nan = float("nan")
+        return (nan, nan, nan), True
+    X1 = B * (T4 - P - P) - d_term
     X2 = abs(X1) ** S
     T2b = 1.0 / T3
     T3b = B * T2b
@@ -123,7 +155,13 @@ def _tc(A, B, C, D):
             else:
                 ang = math.atan2(X3d, T1) * S
                 cosv = math.cos(ang)
-                sinpart = (1.0 - cosv * cosv) ** 0.5 * Tc
+                # max(0.0, ...) guards against cosv*cosv rounding
+                # fractionally above 1.0: without it, a negative base
+                # here silently produces a complex sinpart (Python's
+                # ** does not raise on a negative base with a
+                # fractional exponent), which would then hit an
+                # unhandled TypeError at the x2 <= x3 comparison below.
+                sinpart = max(0.0, 1.0 - cosv * cosv) ** 0.5 * Tc
                 scv = cosv * T2c
                 x1 = scv + scv
                 x2 = sinpart - scv
@@ -162,6 +200,122 @@ def _tc(A, B, C, D):
 _DEGENERATE_TOL = 1e-13
 
 
+def _degenerate_branch(A, B, C, D, X, reduced_c0, reduced_c1, reduced_c2):
+    """Shared logic for both of Kahan's degenerate-coefficient
+    branches. X is Kahan's own direct approximation (-B/A for the
+    escaped root, or -D/C for the collapsed one). reduced_c0..c2 give
+    the quadratic (Bx^2+Cx+D or Ax^2+Bx+C) that's supposed to hold
+    the other two roots.
+
+    Picking the right anchor root to trust needs one of two different
+    strategies depending on what the reduced quadratic's own roots
+    look like, and using the wrong one for a given case corrupts an
+    already-correct root instead of fixing a broken one:
+
+    - If the reduced quadratic's two roots are themselves wildly
+      different in magnitude (a doubly-degenerate case within the
+      already-degenerate branch), its smaller-magnitude root is the
+      reliable one, not X: X can come out representing the *sum* of
+      a large pair rather than a single clean root when the "one
+      root escapes/collapses cleanly" assumption Kahan's X is built
+      on doesn't hold.
+    - Otherwise (the reduced quadratic's two roots are comparable in
+      magnitude, e.g. a genuine complex-conjugate pair), there's no
+      meaningfully "smaller" one to prefer, and X is the reliable
+      anchor.
+
+    Either way, only that one anchor root is trusted; the other two
+    are re-derived from A x^3+B x^2+C x+D's own Vieta sum-of-roots
+    and product-of-roots relations rather than taken directly from
+    the reduced quadratic, which is only a leading-order
+    approximation. Both branches of this decision are confirmed
+    against cases matching mpmath to full float64 precision (see
+    test_tc.py).
+    """
+    ra, rb = _quadratic_roots(reduced_c0, reduced_c1, reduced_c2)
+    mag_a, mag_b = abs(ra), abs(rb)
+    if mag_a > 0 and mag_b > 0 and min(mag_a, mag_b) < 1e-8 * max(mag_a, mag_b):
+        r0 = ra if mag_a <= mag_b else rb
+    else:
+        # No magnitude split to fall back on, so X has to be the
+        # anchor. Sanity-check it first: X is derived by assuming
+        # some terms of A x^3+B x^2+C x+D are negligible at x=X, an
+        # assumption that silently fails when a *third* coefficient
+        # (typically A) is also extreme, a compound degeneracy
+        # Kahan's single-pattern derivation doesn't cover. If the
+        # terms it assumed negligible aren't actually negligible
+        # compared to D here, X isn't a real root at all (confirmed
+        # against a case where it was off by 37 orders of magnitude,
+        # see test_tc.py) - bail out to the general Lebedev path
+        # instead, which handles this correctly via its own
+        # normalization.
+        # X at or near 0 needs its own exemption from this check, for
+        # the same reason a from-scratch residual check on a
+        # candidate root of exactly 0 doesn't work in general: Q(0) =
+        # D identically, and the same problem reappears in softened
+        # form for any X small enough that every dropped term
+        # involving it underflows towards 0 too, leaving "residual"
+        # trivially equal to D regardless of whether X is actually
+        # correct (see test_tc.py for cases, including a subnormal
+        # X ~1e-322, where this check would otherwise reject a
+        # legitimately correct answer with a meaningless ratio of
+        # exactly 1). 1e-300 is nowhere near the magnitudes X takes
+        # in the compound-degeneracy case this check exists to catch
+        # (~1e-29 there), so this stays a safe exemption, not a
+        # loophole back into the original bug.
+        if abs(X) > 1e-300:
+            t0, t1, t2, t3 = A * X * X * X, B * X * X, C * X, D
+            residual = t0 + t1 + t2 + t3
+            scale = max(abs(t0), abs(t1), abs(t2), abs(t3), 1e-300)
+            if abs(residual) > 1e-6 * scale:
+                return None
+        r0 = X
+    sum_all = -B / A
+    product_all = -D / A
+    if r0 == 0:
+        return complex(X), ra, rb
+    r1, r2 = _quadratic_roots(product_all / r0, -(sum_all - r0), 1.0)
+    return complex(r0), r1, r2
+
+
+def _refine_tiny_leftover_root(roots, A, D):
+    """If one of three candidate roots is many orders of magnitude
+    smaller than the other two, it's likely the residual left over
+    after near-total cancellation between two large, opposite-signed
+    roots, and can lose most of its significant digits even though
+    the two large roots are themselves individually accurate.
+    Recomputing it from Vieta's product-of-roots relation using the
+    other two (rather than trusting whatever the main computation
+    produced for it directly) recovers full precision: confirmed
+    against a case matching mpmath to 1.5e-16 relative error, versus
+    the unrefined value being wrong by 15 orders of magnitude (see
+    test_tc.py).
+
+    Deliberately narrow, and NOT used by _degenerate_branch: there
+    it's the *large* extrapolated value that's unreliable and the
+    small one that's already accurate, the opposite pattern, so
+    applying this same rule there would corrupt an already-correct
+    root instead of fixing a broken one.
+    """
+    mags = [abs(r) for r in roots]
+    scale = max(mags)
+    if scale == 0:
+        return roots
+    i = min(range(3), key=lambda k: mags[k])
+    if mags[i] > 1e-8 * scale:
+        return roots
+    others = [roots[k] for k in range(3) if k != i]
+    denom = others[0] * others[1]
+    if denom == 0 or not cmath.isfinite(denom):
+        return roots
+    refined = (-D / A) / denom
+    if not cmath.isfinite(refined):
+        return roots
+    result = list(roots)
+    result[i] = refined
+    return tuple(result)
+
+
 def _solve_core(A, B, C, D):
     """Degenerate-coefficient checks (Kahan sec. 8) plus the main
     Lebedev + deflation pipeline. Returns a (r0, r1, r2) tuple of
@@ -175,14 +329,20 @@ def _solve_core(A, B, C, D):
     well approximated by -D/C, with the other two roots coming from
     A x^2+B x+C=0.
     """
+    # _degenerate_branch returns None if it finds a compound
+    # degeneracy its single-pattern derivation doesn't cover (see its
+    # docstring); when that happens, fall through instead of
+    # returning, all the way to the general path below if neither
+    # named pattern actually applies, which handles it correctly via
+    # its own normalization.
     if abs(A) < _DEGENERATE_TOL * abs(B):
-        X = -B / A
-        q0, q1 = _quadratic_roots(D, C, B)
-        return complex(X), q0, q1
+        result = _degenerate_branch(A, B, C, D, -B / A, D, C, B)
+        if result is not None:
+            return result
     if abs(D) < _DEGENERATE_TOL * abs(C):
-        X = -D / C
-        q0, q1 = _quadratic_roots(C, B, A)
-        return complex(X), q0, q1
+        result = _degenerate_branch(A, B, C, D, -D / C, C, B, A)
+        if result is not None:
+            return result
 
     (x1, x2, x3), three_real = _tc(A, B, C, D)
     if three_real:
@@ -198,8 +358,11 @@ def _solve_core(A, B, C, D):
     if mingap > 0.1 and _all_finite(r1, r2, r3):
         # roots are comfortably separated: the raw formula is already
         # accurate here (verified by fuzzing, see test_tc.py), skip
-        # the extra cost of deflation.
-        return r1, r2, r3
+        # the extra cost of deflation. Still worth the cheap check for
+        # a tiny leftover root though: a huge/huge/tiny magnitude
+        # split can pass this gap test easily (the huge pair looks
+        # "separated") while the tiny one is a cancellation residual.
+        return _refine_tiny_leftover_root((r1, r2, r3), A, D)
 
     if three_real:
         d12 = abs(x1 - x2)
@@ -219,8 +382,9 @@ def _solve_core(A, B, C, D):
 
     # Kahan's deflation formulas (Cubic.pdf sec. 3): divide the known
     # root X out of the cubic to get the quadratic whose roots are
-    # the other two.
-    if abs(X ** 3) > abs(D / A):
+    # the other two. X*X*X instead of X**3: Python's ** on a float
+    # raises OverflowError instead of saturating to inf, unlike *.
+    if abs(X * X * X) > abs(D / A):
         C2 = -D / X
         B1 = (C2 - C) / X
     else:
@@ -228,7 +392,7 @@ def _solve_core(A, B, C, D):
         C2 = B1 * X + C
 
     q0, q1 = _quadratic_roots(C2, B1, A)
-    return complex(X), q0, q1
+    return _refine_tiny_leftover_root((complex(X), q0, q1), A, D)
 
 
 def cubic_roots(A, B, C, D):
@@ -293,5 +457,6 @@ def cubic_roots(A, B, C, D):
 
     raise ArithmeticError(
         "no finite roots found: coefficients are too extreme for "
-        "this formula (some root likely does not fit in a float)"
+        "this formula (some root likely does not fit in a float, or "
+        "an unrecognized overflow/underflow pattern in its coefficients)"
     )

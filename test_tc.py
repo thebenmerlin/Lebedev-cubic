@@ -124,6 +124,85 @@ def test_genuinely_unrepresentable_roots_raise_not_silently_wrong():
                     4.033899228025724e+75, -1.4759492198394687e+117)
 
 
+def test_ac_underflow_does_not_silently_misroute_to_a_fake_triple_root():
+    # Found by an independent security review before this shipped:
+    # A and C individually looked fine after normalizing by the
+    # overall max coefficient, but 3*A*C itself underflowed to
+    # exactly 0.0, corrupting an intermediate term (P) and silently
+    # routing this into the "triple root at the origin" branch for a
+    # cubic that has nothing of the sort. It returned (0, huge,
+    # -huge) with a residual on the order of D itself - not
+    # approximately right, not a root at all. D here is close enough
+    # to float64's limit (~8.6e307) that the rescaling fallback can't
+    # fully recover a correct answer either, so the fixed, correct
+    # behavior is to fail safe (raise) rather than guess.
+    A, B, C, D = 1.0, -0.0, -3.6750000000000003e+205, \
+        -8.575000000000001e+307
+    with pytest.raises(ArithmeticError):
+        cubic_roots(A, B, C, D)
+
+
+def test_genuine_near_zero_roots_are_not_rejected():
+    # A companion case to the one above: here 0.0 genuinely *is* the
+    # correct float64 answer for two of the three roots (confirmed
+    # against mpmath at 1200 digits of precision), not a misroute.
+    # An earlier, overly blunt fix for the bug above (a residual
+    # check applied uniformly to every root) rejected this
+    # legitimate answer, since Q(0) = D identically regardless of
+    # whether 0 is the right root, making that check meaningless
+    # right at 0. Confirms that regression stays fixed.
+    A, B, C, D = -1.561751275291703e+147, -1.6927153959491392e+281, \
+        9.514815710074996e-105, -1.3264030610177571e-77
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
+def test_tiny_leftover_root_from_huge_pair_cancellation():
+    # Found by a systematic sweep over all 6 pairs of coefficients
+    # pushed to extreme, uncorrelated magnitudes: two roots land at
+    # ~6e53 and ~-6e53, and the third (true value ~-1.77e-4) is what's
+    # left over after they nearly cancel. The unrefined computation
+    # got that leftover root wrong by 15 orders of magnitude even
+    # though the two large roots were individually accurate to full
+    # precision; recomputing it from Vieta's product-of-roots
+    # relation using the other two fixes it.
+    A, B, C, D = -1.2046889379604413e-106, -1.202895591388265e-130, \
+        44.26347838804574, 0.007826638382920238
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-9
+
+
+def test_compound_degeneracy_where_a_is_also_extreme():
+    # D negligible next to C fires correctly here, but A is *also*
+    # absurdly large relative to C (a compound degeneracy Kahan's
+    # single-pattern derivation doesn't cover), which makes X = -D/C
+    # not an actual root at all: Q(X) came out ~1e38 away from zero,
+    # not approximately right. Falling through to the general Lebedev
+    # path instead (which handles it correctly via its own
+    # normalization) fixes it.
+    A, B, C, D = 3.9569641531183267e+124, -0.05581608706392034, \
+        5.483624929179232e+29, 10.047002261075267
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-9
+
+
+def test_subnormal_x_is_not_rejected_by_the_compound_degeneracy_check():
+    # A companion case to the one above: X here is a subnormal
+    # number (~1e-322), and 0 genuinely is (to within float64's
+    # resolution) the correct answer for that root. The compound-
+    # degeneracy sanity check on X has the same Q(0)-is-uninformative
+    # blind spot as the very first fix in this file when X is at or
+    # near 0, and needs the same kind of exemption.
+    A, B, C, D = -1.9192995433020904e+44, 1.1331553724392622e-212, \
+        9.619131160888853e+267, 3.5631818321321395e-119
+    got = cubic_roots(A, B, C, D)
+    true = mp_roots(A, B, C, D)
+    assert match_error(got, true) < 1e-6
+
+
 # ---------------------------------------------------------------------
 # Randomized correctness, against mpmath ground truth
 # ---------------------------------------------------------------------
@@ -174,6 +253,25 @@ def test_random_clustered_roots_match_mpmath(seed):
         # harder to resolve to full precision for any method (see
         # README.md, this matches Kahan's own accuracy analysis).
         assert match_error(got, true) < 1e-4, (A, B, C, D)
+
+
+def test_always_returns_complex_not_bare_float():
+    # Found by an independent security review: _degenerate_branch's
+    # anchor-root fallback returned X (a plain float) unwrapped in
+    # two of its return statements, so cubic_roots could hand back a
+    # tuple mixing float and complex entries - a silent violation of
+    # the documented "tuple of 3 complex numbers" contract (harmless
+    # numerically since float and complex interoperate, but would
+    # surprise any caller doing isinstance()/type() dispatch).
+    cases = [
+        (-1.561751275291703e+147, -1.6927153959491392e+281,
+         9.514815710074996e-105, -1.3264030610177571e-77),
+        (-1.9192995433020904e+44, 1.1331553724392622e-212,
+         9.619131160888853e+267, 3.5631818321321395e-119),
+    ]
+    for A, B, C, D in cases:
+        for r in cubic_roots(A, B, C, D):
+            assert isinstance(r, complex), (A, B, C, D, type(r))
 
 
 def test_never_returns_non_finite_without_raising():
